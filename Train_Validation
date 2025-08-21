@@ -1,0 +1,791 @@
+# =================================================================
+#     第二阶段_模型训练与迭代扩展 三分类+卫生权重1.5
+# =================================================================
+
+# ----------------- 环境配置和导入 -----------------
+import os
+import sys
+import random
+import tensorflow as tf
+import pickle
+import json
+import gc
+import math
+import numpy as np
+from datetime import datetime
+import nltk
+import csv
+from sklearn.utils.class_weight import compute_class_weight
+
+# 强制禁用XLA以解决兼容性问题
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_enable_xla_devices=false"
+os.environ['TF_CUDNN_USE_AUTOTUNE'] = '0'
+
+# 确保Python能够找到你的项目文件夹
+try:
+    sys.path.append('/content/drive/MyDrive/Dissertation/allinone/ConWea/')
+    from util import *
+except FileNotFoundError:
+    print(" ERROR: Project path not found or util.py is missing.")
+    pass
+
+# =================================================================
+#             --- 脚本总开关 ---
+# =================================================================
+# 在这里控制是否进行微调。True = 进行微调, False = 跳过微调
+DO_FINETUNE = True
+DO_SAVE_MODEL = True
+INTERACTIVE_PRUNING = True # <--- 设置为 True 来启用手动裁剪功能
+# =================================================================
+
+# 固定随机种子，提升复现性
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# NLTK资源下载
+print("Downloading NLTK resources...")
+try:
+    nltk.download('punkt_tab', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    print("NLTK resources downloaded.")
+except Exception as _e:
+    print("NLTK download failed:", _e)
+
+# 依赖库
+from sklearn.metrics import classification_report, f1_score, accuracy_score
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.feature_extraction.text import CountVectorizer
+from collections import defaultdict
+from gensim.models import word2vec
+from nltk.corpus import stopwords
+import keras
+from keras.layers import (
+    Dense, GRU, TimeDistributed, Input,
+    Embedding, Bidirectional, Lambda,
+    Masking
+)
+from keras.models import Model
+from keras import backend as K
+
+# ---- Mixed Precision ----
+try:
+    try:
+        from tensorflow.keras import mixed_precision as mp
+    except ImportError:
+        import keras.mixed_precision as mp
+    mp.set_global_policy('mixed_float16')
+    print("[MP] mixed_float16 enabled.")
+except Exception as _e:
+    print("[MP] mixed precision not enabled:", _e)
+
+# ---- 批量大小候选 + 学习率缩放 ----
+BATCH_CANDIDATES = [1024, 512, 256]
+BASE_LR = 1e-3
+
+def lr_for_batch(bs, base=BASE_LR):
+    scale = {256: 1.0, 512: 1.5, 1024: 2.0}.get(bs, bs / 256)
+    return base * scale
+
+# ----------------- 日志与快照工具 -----------------
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+
+def save_json(obj, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def append_metrics_csv(csv_path, row_dict, header_order):
+    header_needed = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header_order)
+        if header_needed:
+            w.writeheader()
+        w.writerow(row_dict)
+
+def components_topN(components, N=20):
+    out = {}
+    for lbl, d in components.items():
+        pairs = sorted(d.items(), key=lambda kv: kv[1].get("rank", 0.0), reverse=True)[:N]
+        out[lbl] = [{"word": w, **stats} for w, stats in pairs]
+    return out
+
+# =================================================================
+#     内置模型定义 (不再依赖外部 .py 文件)
+# =================================================================
+class AttentionLayer(keras.layers.Layer):
+    def __init__(self, context_vector_length=100, **kwargs):
+        super().__init__(**kwargs)
+        self.context_vector_length = context_vector_length
+    def build(self, input_shape):
+        dim = input_shape[2]
+        self.W = self.add_weight(name='W', shape=(dim, self.context_vector_length), initializer='uniform', trainable=True)
+        self.u = self.add_weight(name='context_vector', shape=(self.context_vector_length, 1), initializer='uniform', trainable=True)
+        super().build(input_shape)
+    def _get_attention_weights(self, X):
+        u_tw = keras.activations.tanh(tf.linalg.matmul(X, self.W))
+        tw_stimulus = tf.linalg.matmul(u_tw, self.u)
+        tw_stimulus = tf.squeeze(tw_stimulus, axis=-1)
+        return keras.activations.softmax(tw_stimulus, axis=-1)
+    def call(self, X):
+        att_weights = self._get_attention_weights(X)
+        att_weights_reshaped = tf.expand_dims(att_weights, axis=-1)
+        weighted_input = X * att_weights_reshaped
+        return tf.reduce_sum(weighted_input, axis=1)
+    def get_config(self):
+        config = super().get_config()
+        config.update({'context_vector_length': self.context_vector_length})
+        return config
+
+class HAN(Model):
+    def __init__(
+            self, max_words, max_sentences, output_size,
+            embedding_matrix, word_encoding_dim=200,
+            sentence_encoding_dim=200, name='han-for-docla', **kwargs
+    ):
+        super().__init__(name=name, **kwargs)
+        self.max_words = max_words
+        self.max_sentences = max_sentences
+        self.output_size = output_size
+        self.embedding_matrix = np.array(embedding_matrix)
+        self.word_encoding_dim = word_encoding_dim
+        self.sentence_encoding_dim = sentence_encoding_dim
+        self.word_encoder_model = self._build_word_encoder()
+        self.word_attention = TimeDistributed(AttentionLayer(), name='word_attention')
+        self.sentence_encoder_model = self._build_sentence_encoder()
+        self.sentence_attention = AttentionLayer(name='sentence_attention')
+        self.class_prediction = Dense(self.output_size, activation='softmax', name='class_prediction', dtype='float32')
+    def _build_word_encoder(self):
+        assert self.word_encoding_dim % 2 == 0
+        vocab_size, embed_dim = self.embedding_matrix.shape
+        embedding_layer = Embedding(
+            vocab_size, embed_dim, weights=[self.embedding_matrix],
+            input_length=self.max_words, trainable=False, mask_zero=True
+        )
+        sentence_input = Input(shape=(self.max_words,), dtype='int32')
+        embedded = embedding_layer(sentence_input)
+        encoded = Bidirectional(GRU(int(self.word_encoding_dim / 2), return_sequences=True, recurrent_dropout=0.1))(embedded)
+        return Model(inputs=sentence_input, outputs=encoded, name='word_encoder')
+    def _build_sentence_encoder(self):
+        assert self.sentence_encoding_dim % 2 == 0
+        text_input = Input(shape=(self.max_sentences, self.word_encoding_dim))
+        encoded = Bidirectional(GRU(int(self.sentence_encoding_dim / 2), return_sequences=True, recurrent_dropout=0.1))(text_input)
+        return Model(inputs=text_input, outputs=encoded, name='sentence_encoder')
+    def call(self, inputs):
+        embedded_sentences = TimeDistributed(self.word_encoder_model)(inputs)
+        word_att_output = self.word_attention(embedded_sentences)
+        doc_encoded = self.sentence_encoder_model(word_att_output)
+        doc_summary = self.sentence_attention(doc_encoded)
+        return self.class_prediction(doc_summary)
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'max_words': self.max_words, 'max_sentences': self.max_sentences,
+            'output_size': self.output_size, 'embedding_shape': self.embedding_matrix.shape,
+            'word_encoding_dim': self.word_encoding_dim, 'sentence_encoding_dim': self.sentence_encoding_dim
+        })
+        return config
+    @classmethod
+    def from_config(cls, config):
+        embedding_shape = config.pop('embedding_shape')
+        dummy_matrix = np.zeros(embedding_shape)
+        return cls(embedding_matrix=dummy_matrix, **config)
+
+# =================================================================
+#     所有必需的辅助函数
+# =================================================================
+def train_word2vec(df, dataset_path):
+    def get_embeddings(inp_data, tokenizer, size_features=100, mode='skipgram', min_count=1, context=5):
+        num_workers = 15
+        downsampling = 1e-3
+        print('Training Word2Vec model...')
+        vocabulary_inv = {v: k for k, v in tokenizer.word_index.items()}
+        sentences = [[vocabulary_inv[w] for w in s if w in vocabulary_inv] for s in inp_data]
+        sentences = [s for s in sentences if s]
+        if not sentences:
+            print("Warning: No valid sentences in corpus for Word2Vec training.")
+            return np.zeros((len(vocabulary_inv) + 1, size_features))
+        sg = 1 if mode == 'skipgram' else 0
+        print('Model:', 'skip-gram' if sg == 1 else 'CBOW')
+        embedding_model = word2vec.Word2Vec(
+            sentences=sentences, workers=num_workers, sg=sg,
+            vector_size=size_features, min_count=min_count,
+            window=context, sample=downsampling
+        )
+        embedding_model.train(
+            corpus_iterable=sentences,
+            total_examples=embedding_model.corpus_count,
+            epochs=embedding_model.epochs
+        )
+        embedding_weights = np.zeros((len(vocabulary_inv) + 1, size_features))
+        embedding_weights[0] = 0
+        for i, word in vocabulary_inv.items():
+            if word in embedding_model.wv:
+                embedding_weights[i] = embedding_model.wv[word]
+            else:
+                embedding_weights[i] = np.random.uniform(-0.25, 0.25, embedding_model.vector_size)
+        return embedding_weights
+
+    tokenizer = fit_get_tokenizer(df.sentence, max_words=150000)
+    print("Total number of words: ", len(tokenizer.word_index))
+    tagged_data = tokenizer.texts_to_sequences(df.sentence)
+    embedding_mat = get_embeddings(tagged_data, tokenizer)
+    pickle.dump(tokenizer, open(os.path.join(dataset_path, "tokenizer8.pkl"), "wb"))
+    pickle.dump(embedding_mat, open(os.path.join(dataset_path, "embedding_matrix8.pkl"), "wb"))
+
+def preprocess(df, word_cluster):
+    print("Preprocessing data..")
+    stop_words = set(stopwords.words('english'))
+    stop_words.add('would')
+    word_vec = {}
+    for index, row in df.iterrows():
+        if index % 1000 == 0:
+            print(f"Finished rows: {index} out of {str(len(df))}")
+        line = row["sentence"]
+        words = line.strip().split()
+        new_words = []
+        for word in words:
+            if word not in word_vec:
+                vec = get_vec(word, word_cluster, stop_words)
+                if len(vec) == 0:
+                    continue
+                word_vec[word] = vec
+            new_words.append(word)
+        df.loc[index, "sentence"] = " ".join(new_words)
+    return df, word_vec
+
+def generate_pseudo_labels(df, labels, label_term_dict, tokenizer, label_weight_map):
+    """
+    基于种子词生成伪标签（加权投票）：
+      - [新] 采用归一化分数，消除类别大小偏见
+      - 每个标签的最终分数 = (命中种子词数 / 该标签总种子词数) * 类别权重
+      - 卫生类标签权重1.5，其他1.0（由 label_weight_map 提供）
+    """
+    y, X, y_true = [], [], []
+    index_word = {v: k for k, v in tokenizer.word_index.items()}
+
+    print("Generating pseudo-labels with NORMALIZED scoring...") # 添加日志，确认新版函数被调用
+
+    for index, row in df.iterrows():
+        if index > 0 and index % 20000 == 0:
+             print(f"  > Processing row {index}/{len(df)}") # 添加处理进度
+
+        line, label = row["sentence"], row["label"]
+        tokens = tokenizer.texts_to_sequences([line])[0]
+        words = [index_word[tok] for tok in tokens if tok in index_word]
+
+        score_dict = {}  # {label: float_score}
+        has_any = False
+
+        for l in labels:
+            seed_words = set(label_term_dict.get(l, []))
+
+            # --- 核心修改开始 ---
+
+            # 1. 获取类别总种子词数，并防止除以0的错误
+            total_seeds = len(seed_words)
+            if total_seeds == 0:
+                continue
+
+            # 2. 计算句子中的词命中该类别种子词的次数
+            #    注意: 这里遵循你原始逻辑，重复命中会重复计数。
+            #    如果想按去重词计数，可以把 `words` 替换为 `set(words)`
+            hit_count = sum(1.0 for wd in words if wd in seed_words)
+
+            if hit_count == 0:
+                continue
+
+            has_any = True
+
+            # 3. 计算归一化分数（即“命中率”），这消除了大类别天生占优的问题
+            normalized_score = hit_count / total_seeds
+
+            # 4. 获取该类别的特定权重（例如 health 的 1.5）
+            w = float(label_weight_map.get(l, 1.0))
+
+            # 5. 计算最终加权分数
+            final_score = normalized_score * w
+
+            # --- 核心修改结束 ---
+
+            score_dict[l] = score_dict.get(l, 0.0) + final_score
+
+        if has_any:
+            # 使用 lambda 函数安全地找出最高分标签，避免 score_dict 为空时出错
+            best_label = max(score_dict.items(), key=lambda item: item[1])[0] if score_dict else None
+
+            if best_label:
+                y.append(best_label)
+                X.append(line)
+                y_true.append(label)
+
+    # 打印出各类别的样本数量，方便你立刻检查效果
+    print("--- Pseudo-label Distribution ---")
+    from collections import Counter
+    label_counts = Counter(y)
+    for lbl, count in label_counts.most_common():
+        print(f"  {lbl}: {count} samples")
+    print("---------------------------------")
+
+
+    return X, y, y_true
+
+# 注意：argmax_label 函数不再需要，因为我们直接在上面用 max() 实现了
+# 你可以删除 def argmax_label(...) 这个辅助函数
+
+def _evaluate_on_val(model, X_val, y_val, index_to_label):
+    pred_val = model.predict(X_val, verbose=0)
+    y_pred_lbl = get_from_one_hot(pred_val, index_to_label)
+    y_true_lbl = get_from_one_hot(y_val, index_to_label)
+    acc = accuracy_score(y_true_lbl, y_pred_lbl)
+    f1_macro = f1_score(y_true_lbl, y_pred_lbl, average='macro', zero_division=0)
+    f1_micro = f1_score(y_true_lbl, y_pred_lbl, average='micro', zero_division=0)
+    f1_weighted = f1_score(y_true_lbl, y_pred_lbl, average='weighted', zero_division=0)
+    return acc, f1_macro, f1_micro, f1_weighted, y_pred_lbl
+
+def expand_seeds(df, label_term_dict, pred_labels, label_to_index, index_to_label, word_to_index, index_to_word, inv_docfreq, docfreq, it, n1, doc_freq_thresh=5):
+    def get_rank_matrix(
+        docfreq, inv_docfreq, label_count, label_docs_dict, label_to_index,
+        term_count, word_to_index, doc_freq_thresh
+    ):
+        E_LT = np.zeros((label_count, term_count))
+        components = {}
+        for l in label_docs_dict:
+            components[l] = {}
+            docs = label_docs_dict[l]
+            if not docs:
+                continue
+            docfreq_local = calculate_doc_freq(docs)
+            vect = CountVectorizer(vocabulary=list(word_to_index.keys()), tokenizer=lambda x: x.split())
+            X = vect.fit_transform(docs)
+            X_arr = X.toarray()
+            rel_freq = np.sum(X_arr, axis=0) / len(docs)
+            names = vect.get_feature_names_out()
+            for i, name in enumerate(names):
+                if name not in docfreq_local or docfreq_local[name] < doc_freq_thresh \
+                   or name not in docfreq or name not in inv_docfreq:
+                    continue
+                rank = (docfreq_local[name] / docfreq[name]) * inv_docfreq[name] * np.tanh(rel_freq[i])
+                E_LT[label_to_index[l]][word_to_index[name]] = rank
+                components[l][name] = {
+                    "reldocfreq": docfreq_local[name] / docfreq[name],
+                    "idf": inv_docfreq[name],
+                    "rel_freq": np.tanh(rel_freq[i]),
+                    "rank": rank
+                }
+        return E_LT, components
+
+    def disambiguate(label_term_dict, components):
+        new_dic = {}
+        for l in label_term_dict:
+            all_interp_seeds = label_term_dict[l]
+            seed_to_all_interp = defaultdict(set)
+            disambiguated_seed_list = []
+            for item in all_interp_seeds:
+                if isinstance(item, (tuple, list)) and len(item) > 0:
+                    word = str(item[0])
+                else:
+                    word = str(item)
+                temp = word.split("$")
+                if len(temp) == 1:
+                    disambiguated_seed_list.append(word)
+                else:
+                    seed_to_all_interp[temp[0]].add(word)
+            for seed, interpretations in seed_to_all_interp.items():
+                max_interp, maxi = "", -1
+                for interp in interpretations:
+                    if l in components and interp in components[l] and components[l][interp]["rank"] > maxi:
+                        max_interp, maxi = interp, components[l][interp]["rank"]
+                if max_interp:
+                    disambiguated_seed_list.append(max_interp)
+            new_dic[l] = disambiguated_seed_list
+        return new_dic
+
+    def expand(E_LT, index_to_label, index_to_word, it, label_count, n1, old_label_term_dict, label_docs_dict):
+        word_map = {}
+        zero_docs_labels = set()
+        for l in range(label_count):
+            label_name = index_to_label[l]
+            if not np.any(E_LT[l]) or not label_docs_dict.get(label_name):
+                zero_docs_labels.add(label_name)
+                continue
+            n = min(n1 * (it), int(math.log(len(label_docs_dict[label_name]) + 1, 1.5)))
+            inds_popular = E_LT[l].argsort()[::-1][:int(n)]
+            for word_ind in inds_popular:
+                word = index_to_word[word_ind]
+                if word not in word_map or E_LT[l][word_ind] > word_map[word][1]:
+                    word_map[word] = (label_name, E_LT[l][word_ind])
+        new_label_term_dict = defaultdict(set)
+        for word, (label, val) in word_map.items():
+            new_label_term_dict[label].add(word)
+        for l in zero_docs_labels:
+            new_label_term_dict[l] = set(old_label_term_dict.get(l, []))
+        return new_label_term_dict
+
+    label_count, term_count = len(label_to_index), len(word_to_index)
+    label_docs_dict = get_label_docs_dict(df, label_term_dict, pred_labels)
+    E_LT, components = get_rank_matrix(
+        docfreq, inv_docfreq, label_count, label_docs_dict, label_to_index,
+        term_count, word_to_index, doc_freq_thresh
+    )
+    if it == 0:
+        print("Disambiguating seeds..")
+        label_term_dict = disambiguate(label_term_dict, components)
+    else:
+        print("Expanding seeds..")
+        label_term_dict = expand(
+            E_LT, index_to_label, index_to_word, it, label_count, n1, label_term_dict, label_docs_dict
+        )
+
+    # ✅✅✅ FIX: Ensure this return statement is correctly indented
+    # It should be at the same level as the 'if it == 0:' block above.
+    return label_term_dict, components
+
+def disambiguate(label_term_dict, components):
+    new_dic = {}
+    for l in label_term_dict:
+        all_interp_seeds = label_term_dict[l]
+        seed_to_all_interp = defaultdict(set)
+        disambiguated_seed_list = []
+
+        for item in all_interp_seeds: # Use 'item' to avoid confusion
+
+            # --- START OF FIX ---
+            # Check if the item is a tuple or list, and extract the word string
+            # This makes the function robust to mixed data types in the seed list.
+            if isinstance(item, (tuple, list)) and len(item) > 0:
+                word = str(item[0])
+            else:
+                word = str(item)
+            # --- END OF FIX ---
+
+            # Now, the 'word' variable is guaranteed to be a string
+            temp = word.split("$")
+            if len(temp) == 1:
+                disambiguated_seed_list.append(word)
+            else:
+                seed_to_all_interp[temp[0]].add(word)
+
+        for seed, interpretations in seed_to_all_interp.items():
+            max_interp, maxi = "", -1
+            for interp in interpretations:
+                if l in components and interp in components[l] and components[l][interp]["rank"] > maxi:
+                    max_interp, maxi = interp, components[l][interp]["rank"]
+            if max_interp:
+                disambiguated_seed_list.append(max_interp)
+        new_dic[l] = disambiguated_seed_list
+    return new_dic
+
+    def expand(E_LT, index_to_label, index_to_word, it, label_count, n1, old_label_term_dict, label_docs_dict):
+        word_map = {}
+        zero_docs_labels = set()
+        for l in range(label_count):
+            label_name = index_to_label[l]
+            if not np.any(E_LT[l]) or not label_docs_dict.get(label_name):
+                zero_docs_labels.add(label_name)
+                continue
+            n = min(n1 * (it), int(math.log(len(label_docs_dict[label_name]) + 1, 1.5)))
+            inds_popular = E_LT[l].argsort()[::-1][:int(n)]
+            for word_ind in inds_popular:
+                word = index_to_word[word_ind]
+                if word not in word_map or E_LT[l][word_ind] > word_map[word][1]:
+                    word_map[word] = (label_name, E_LT[l][word_ind])
+        new_label_term_dict = defaultdict(set)
+        for word, (label, val) in word_map.items():
+            new_label_term_dict[label].add(word)
+        for l in zero_docs_labels:
+            new_label_term_dict[l] = set(old_label_term_dict.get(l, []))
+        return new_label_term_dict
+
+    label_count, term_count = len(label_to_index), len(word_to_index)
+    label_docs_dict = get_label_docs_dict(df, label_term_dict, pred_labels)
+    E_LT, components = get_rank_matrix(
+        docfreq, inv_docfreq, label_count, label_docs_dict, label_to_index,
+        term_count, word_to_index, doc_freq_thresh
+    )
+    if it == 0:
+        print("Disambiguating seeds..")
+        label_term_dict = disambiguate(label_term_dict, components)
+    else:
+        print("Expanding seeds..")
+        label_term_dict = expand(
+            E_LT, index_to_label, index_to_word, it, label_count, n1, label_term_dict, label_docs_dict
+        )
+    return label_term_dict, components
+
+# ========= NEW: 从 label_term_dict 自动构建标签权重表 =========
+def build_label_weight_map_from_json(label_term_dict):
+    """
+    根据标签名自动赋权：
+      - 卫生相关（health/hygiene/infection/sanitation/housing/food/workplace/factory）→ 1.5
+      - 政治相关（politic/union/strike/parliament/charter/reform）→ 1.0
+      - 其他 → 1.0
+    """
+    weight_map = {}
+    for lbl in label_term_dict.keys():
+        ll = lbl.lower()
+        if any(k in ll for k in ['health','hygiene','infection','sanitation','housing','food','workplace','factory']):
+            weight_map[lbl] = 1.5
+        elif any(k in ll for k in ['politic','union','strike','parliament','charter','reform']):
+            weight_map[lbl] = 1.0
+        else:
+            weight_map[lbl] = 1.0
+    return weight_map
+
+def train_classifier(iter_idx, df, labels, label_term_dict, label_to_index, index_to_label, dataset_path, logs_dir, do_finetune=False):
+    print("Going to train classifier..")
+    basepath = dataset_path
+    dump_dir = os.path.join(basepath, "models", "conwea")
+    tmp_dir = os.path.join(dump_dir, "checkpoints")
+    ensure_dir(dump_dir); ensure_dir(tmp_dir); ensure_dir(logs_dir)
+
+    max_sentence_length, max_sentences = 100, 15
+    tokenizer = pickle.load(open(os.path.join(dataset_path, "tokenizer8.pkl"), "rb"))
+    label_weight_map = build_label_weight_map_from_json(label_term_dict)
+    X, y, y_true = generate_pseudo_labels(
+        df, labels, label_term_dict, tokenizer, label_weight_map
+    )
+
+    y_one_hot = make_one_hot(y, label_to_index)
+
+    # ---- 计算 class_weight ----
+    y_integers = [label_to_index[label] for label in y]
+    classes = np.arange(len(labels))
+    class_weights_arr = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y_integers
+    )
+    class_weights = dict(zip(classes, class_weights_arr))
+    print("Successfully computed Class Weights:", class_weights)
+
+    print("Splitting into train, dev...")
+    X_train, y_train, X_val, y_val = create_train_dev(
+        X, labels=y_one_hot, tokenizer=tokenizer,
+        max_sentences=max_sentences, max_sentence_length=max_sentence_length
+    )
+
+    print("Loading Embedding matrix...")
+    embedding_matrix = pickle.load(open(os.path.join(dataset_path, "embedding_matrix8.pkl"), "rb"))
+
+    trained = False
+    used_bs, used_lr = None, None
+    model = None
+
+    for bs in BATCH_CANDIDATES:
+        try:
+            K.clear_session(); gc.collect()
+
+            print(f"\n[ATTEMPT] Trying batch_size={bs}")
+            model = HAN(
+                max_words=max_sentence_length, max_sentences=max_sentences,
+                output_size=len(y_train[0]), embedding_matrix=embedding_matrix
+            )
+
+            lr = lr_for_batch(bs)
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+            model.compile(loss="categorical_crossentropy", optimizer=optimizer, metrics=['accuracy'])
+
+            if iter_idx == 0 and bs == BATCH_CANDIDATES[-1]:
+                model.summary()
+
+            # ✅ 修改点 1: 根据总开关 DO_SAVE_MODEL 决定是否启用 ModelCheckpoint
+            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=3, restore_best_weights=True)
+
+            callbacks_list = [es] # EarlyStopping 总是启用
+            if DO_SAVE_MODEL:
+                print("[INFO] ModelCheckpoint saving is ENABLED.")
+                mc_filepath = os.path.join(tmp_dir, f'iter{iter_idx}_best.weights.h5')
+                mc = ModelCheckpoint(
+                    filepath=mc_filepath, monitor='val_accuracy', mode='max',
+                    verbose=1, save_weights_only=True, save_best_only=True
+                )
+                callbacks_list.append(mc)
+            else:
+                print("[INFO] ModelCheckpoint saving is DISABLED.")
+
+            model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=100, #轮次在这里
+                batch_size=bs,
+                class_weight=class_weights,
+                callbacks=callbacks_list, # 使用我们动态创建的回调列表
+                verbose=1
+            )
+            trained, used_bs, used_lr = True, bs, lr
+            print(f"[SUCCESS] Training succeeded with batch_size={bs}")
+            break
+
+        except tf.errors.ResourceExhaustedError:
+            print(f"[WARN] OOM at batch_size={bs}, trying smaller batch size...")
+            del model
+
+    if not trained:
+        print("[ERROR] All candidate batch sizes failed. Exiting this iteration.")
+        return None, {}, (None, None, None, None)
+
+    acc, f1_macro, f1_micro, f1_weighted, _ = _evaluate_on_val(model, X_val, y_val, index_to_label)
+    metrics_csv = os.path.join(logs_dir, "iter_metrics.csv")
+    header = ["timestamp","iteration","stage","acc","f1_macro","f1_micro","f1_weighted","batch","lr","n_train","n_val"]
+    main_metrics_row = {
+        "timestamp": datetime.now().isoformat(timespec='seconds'), "iteration": iter_idx,
+        "stage": "main_train", "acc": round(acc, 6), "f1_macro": round(f1_macro, 6),
+        "f1_micro": round(f1_micro, 6), "f1_weighted": round(f1_weighted, 6),
+        "batch": used_bs, "lr": used_lr, "n_train": len(X_train), "n_val": len(X_val)
+    }
+    append_metrics_csv(metrics_csv, main_metrics_row, header)
+
+    if do_finetune:
+        # ... (fine-tuning 逻辑保持不变) ...
+        print("\n[FT] Fine-tuning is enabled. Starting fine-tune stage...")
+        FINETUNE_BS = 256; FINETUNE_EPOCHS = 3; FINETUNE_LR_FACTOR = 0.3
+        try:
+            ft_lr = used_lr * FINETUNE_LR_FACTOR if used_lr else 3e-4
+            print(f"[FT] Start fine-tuning: bs={FINETUNE_BS}, lr={ft_lr}, epochs={FINETUNE_EPOCHS}")
+            es_ft = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=2, restore_best_weights=True)
+            optimizer_ft = tf.keras.optimizers.Adam(learning_rate=ft_lr)
+            model.compile(loss="categorical_crossentropy", optimizer=optimizer_ft, metrics=['accuracy'])
+            model.fit(
+                X_train, y_train, validation_data=(X_val, y_val),
+                epochs=FINETUNE_EPOCHS, batch_size=FINETUNE_BS,
+                callbacks=[es_ft], verbose=1, class_weight=class_weights,
+            )
+            print("[FT] Fine-tune finished.")
+            acc_ft, f1_macro_ft, f1_micro_ft, f1_weighted_ft, _ = _evaluate_on_val(model, X_val, y_val, index_to_label)
+            append_metrics_csv(metrics_csv, {
+                "timestamp": datetime.now().isoformat(timespec='seconds'), "iteration": iter_idx, "stage": "finetune",
+                "acc": round(acc_ft,6), "f1_macro": round(f1_macro_ft,6), "f1_micro": round(f1_micro_ft,6),
+                "f1_weighted": round(f1_weighted_ft,6), "batch": FINETUNE_BS, "lr": ft_lr,
+                "n_train": len(X_train), "n_val": len(X_val)
+            }, header)
+        except tf.errors.ResourceExhaustedError:
+            print("[FT][WARN] OOM during fine-tune, skipping fine-tune step.")
+    else:
+        print("\n[FT] Fine-tuning is disabled by the global switch. Skipping fine-tune stage.")
+
+    # ✅ 修改点 2: 根据总开关 DO_SAVE_MODEL 决定是否执行最终的模型保存
+    if DO_SAVE_MODEL:
+        final_model_path = os.path.join(dump_dir, f"iter{iter_idx}_final.keras")
+        print(f"\n[SAVE] Saving final complete model to: {final_model_path}")
+        model.save(final_model_path)
+    else:
+        print("\n[INFO] Final model saving is disabled by the global switch. Skipping.")
+
+    return model, main_metrics_row, (X_train, y_train, X_val, y_val)
+
+def main(dataset_path, print_flag=True, do_finetune=False):
+    pkl_dump_dir = dataset_path
+    df = pickle.load(open(os.path.join(pkl_dump_dir, "df_contextualized8.pkl"), "rb"))
+    word_cluster = pickle.load(open(os.path.join(pkl_dump_dir, "word_cluster_map8.pkl"), "rb"))
+    with open(os.path.join(pkl_dump_dir, "seedwords_dritte_cat.json")) as fp:
+        label_term_dict = json.load(fp)
+
+    # 启用 add_all_interpretations，以遵循原作者的完整逻辑
+    label_term_dict = add_all_interpretations(label_term_dict, word_cluster)
+    print_label_term_dict(label_term_dict, None, print_components=False)
+
+    labels = list(label_term_dict.keys())
+    label_to_index, index_to_label = create_label_index_maps(labels)
+
+    df, word_vec = preprocess(df, word_cluster)
+    del word_cluster
+    gc.collect()
+
+    word_to_index, index_to_word = create_word_index_maps(word_vec)
+    docfreq = calculate_df_doc_freq(df)
+    inv_docfreq = calculate_inv_doc_freq(df, docfreq)
+
+    logs_dir = os.path.join(dataset_path, "logs_conwea")
+    ensure_dir(logs_dir)
+
+    train_word2vec(df, dataset_path)
+    #迭代在这里
+    num_iterations = 6
+    for i in range(num_iterations):
+        print(f"\n{'='*35} ITERATION: {i} {'='*35}")
+        model, metrics_main, splits = train_classifier(
+            iter_idx=i, df=df, labels=labels, label_term_dict=label_term_dict,
+            label_to_index=label_to_index, index_to_label=index_to_label,
+            dataset_path=dataset_path, logs_dir=logs_dir,
+            do_finetune=do_finetune
+        )
+        if not model:
+            print(f"Skipping expand_seeds for iteration {i} due to training failure.")
+            continue
+
+        tokenizer = pickle.load(open(os.path.join(dataset_path, "tokenizer8.pkl"), "rb"))
+        X_all = prep_data(
+            texts=df["sentence"], max_sentences=15,
+            max_sentence_length=100, tokenizer=tokenizer
+        )
+        pred_all = model.predict(X_all, verbose=0)
+        pred_labels = get_from_one_hot(pred_all, index_to_label)
+
+        label_term_dict, components = expand_seeds(
+            df, label_term_dict, pred_labels, label_to_index, index_to_label,
+            word_to_index, index_to_word, inv_docfreq, docfreq, i, n1=5
+        )
+
+        seeds_path = os.path.join(logs_dir, f"seedwords_iter{i}.json")
+        comps_path = os.path.join(logs_dir, f"components_iter{i}_top20.json")
+        save_json(label_term_dict, seeds_path)
+        save_json(components_topN(components, N=20), comps_path)
+
+        if print_flag:
+            print_label_term_dict(label_term_dict, components)
+
+        # ✅✅✅ 新增：手动裁剪种子词的交互模块 ✅✅✅
+        if INTERACTIVE_PRUNING and i < num_iterations - 1: # 在最后一轮后无需暂停
+            print("\n" + "="*60)
+            print(f"⏸️  ITERATION {i} COMPLETE. SCRIPT IS PAUSED.")
+            print("  The newly expanded/disambiguated seed words have been saved.")
+            print("\n  ACTION REQUIRED:")
+            print(f"  1. 在Google Colab左侧的文件浏览器中找到并打开文件。")
+            print(f"  2. 文件路径: {seeds_path}")
+            print(f"  3. 手动删除文件中任何你不想要的、有噪声的种子词。")
+            print(f"  4. 保存文件 (Ctrl+S 或者 File -> Save)。")
+            print("\n" + "="*60)
+
+            # 这行代码会暂停脚本，直到你在这里按下回车
+            input(">>> 在你编辑并保存完文件后，请在此处按 Enter 键继续下一轮迭代...")
+
+            # 重新加载你手动清理过的种子词，用于下一轮迭代
+            print(f"\n🔄 脚本已恢复。正在从 {seeds_path} 重新加载清理后的种子词...")
+            with open(seeds_path, "r", encoding="utf-8") as f:
+                label_term_dict = json.load(f) # 关键：用你修改过的内容覆盖内存中的变量
+            print("✅ 清理后的种子词已加载。即将开始下一轮迭代。")
+        # ✅✅✅ 交互模块结束 ✅✅✅
+
+        if i == num_iterations - 1:
+            print("\n--- Generating Final Pseudo-Label Report ---")
+            final_results_df = df[['sentence', 'label']].copy()
+            final_results_df['final_predicted_label'] = pred_labels
+            output_path = os.path.join(logs_dir, f"final_pseudo_labels_report_iter{i}.csv")
+            final_results_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            print(f" Final report with predicted pseudo-labels saved to: {output_path}")
+
+# ----------------- 主执行区 -----------------
+if __name__ == '__main__':
+    dataset_path = "/content/drive/MyDrive/Dissertation/allinone/ConWea"
+    gpu_id = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    print("Checking for GPU devices...")
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        print(f" Successfully found {len(gpus)} GPU(s) available.")
+        for gpu in gpus:
+            print(f"   - Device: {gpu.name}")
+    else:
+        print(" No GPU devices found. The process will run on CPU.")
+
+    print(f"\nStarting main process with dataset path: {dataset_path}")
+    try:
+        main(dataset_path=dataset_path, do_finetune=DO_FINETUNE)
+        print("\nProcess finished successfully!")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+        import traceback
+        traceback.print_exc()
